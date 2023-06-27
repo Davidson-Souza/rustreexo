@@ -35,7 +35,6 @@ fn main() {
         NodeHash::from_str("d3bd63d53c5a70050a28612a2f4b2019f40951a653ae70736d93745efb1124fa")
             .unwrap();
     let s = s.modify(&[new_utxo], &[utxos[0]], &proof).unwrap().0;
-
     // Now we can verify that the new utxo is in the Stump, and the old one is not.
     let new_proof = Proof::new(vec![2], vec![new_utxo]);
     assert_eq!(new_proof.verify(&[new_utxo], &s), Ok(true));

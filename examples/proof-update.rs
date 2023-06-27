@@ -57,6 +57,7 @@ fn main() {
             update_data,
         )
         .unwrap();
+    // This should be a valid proof over 1..7
     assert_eq!(p2.verify(&cached_hashes, &stump), Ok(true));
 }
 

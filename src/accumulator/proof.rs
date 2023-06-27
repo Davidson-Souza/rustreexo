@@ -41,7 +41,7 @@ use super::{
     util::{get_proof_positions, tree_rows},
 };
 use std::collections::HashMap;
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 /// A proof is a collection of hashes and positions. Each target position
 /// points to a leaf to be proven. Hashes are all
 /// hashes that can't be calculated from the data itself.
@@ -56,7 +56,7 @@ pub struct Proof {
     ///  // |---\   |---\
     ///  //         02  03
     /// ```
-    targets: Vec<u64>,
+    pub targets: Vec<u64>,
 
     /// All the nodes in the tree that are needed to hash up to the root of
     /// the tree. Here, the root is 06. If Targets are [00, 01], then Proof
@@ -69,7 +69,7 @@ pub struct Proof {
     /// // |---\   |---\
     /// // 00  01  02  03
     /// ```
-    hashes: Vec<NodeHash>,
+    pub hashes: Vec<NodeHash>,
 }
 /// We often need to return the targets paired with hashes, and the proof position.
 /// Even not using full qualifications, it gets long and complex, and clippy doesn't like
@@ -607,7 +607,6 @@ impl Proof {
         new_positions.sort();
         Ok(new_positions)
     }
-
     fn sorted_push(nodes: &mut Vec<(u64, NodeHash)>, to_add: (u64, NodeHash)) {
         nodes.push(to_add);
         nodes.sort();
