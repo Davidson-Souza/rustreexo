@@ -33,7 +33,7 @@ use super::{
     proof::Proof,
     util::{
         detect_offset, get_proof_positions, is_left_niece, left_child, right_child, root_position,
-        tree_rows,
+        tree_rows, max_position_at_row,
     },
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +474,71 @@ impl Pollard {
         for value in values {
             self.add_single(*value);
         }
+    }
+    /// to_string returns the full pollard in a string for all forests less than 6 rows.
+    pub fn to_string(&self) -> String {
+        let fh = tree_rows(self.leaves);
+
+        // The accumulator should be less than 6 rows.
+        if fh > 6 {
+                let mut s = format!("Can't print {} leaves. roots:\n", self.leaves);
+                let roots = self.get_roots();
+                for root in roots {
+                        s = s + &format!("{}\n", root.get_data().to_string());
+                }
+                return s
+        }
+
+        let mut output: Vec<String> = vec!["".to_string(); (fh as usize *2)+1];
+        let mut pos: u8 = 0;
+        for h in 0..fh+1 {
+            let rowlen = 1 << (fh - h);
+            for _ in 0..rowlen {
+                let max = max_position_at_row(h, fh, self.leaves).unwrap();
+                if max >= pos as u64 {
+                    match self.get_hash(pos as u64) {
+                        Ok(val) => {
+                            if pos >= 100 {
+                                output[h as usize*2] = output[h as usize*2].to_owned() +
+                                    &format!("{:#02x}:{} ", pos, &val.to_string()[..2]);
+                            } else {
+                                output[h as usize*2] = output[h as usize*2].to_owned() +
+                                    &format!("{:0>2}:{} ", pos, &val.to_string()[..4]);
+                            }
+                        },
+                        Err(_) => {
+                            output[h as usize*2] = output[h as usize*2].to_owned() + &"        ";
+                        },
+                    }
+                }
+
+                if h > 0 {
+                    output[(h as usize*2)-1] = output[(h as usize*2)-1].to_owned() + &"|-------";
+
+                    for _ in 0..((1<<h)-1)/2 {
+                            output[(h as usize*2)-1] = output[(h as usize *2)-1].to_owned() + &"--------";
+                    }
+                    output[(h as usize*2)-1] = output[(h as usize *2)-1].to_owned() + &"\\       ";
+
+                    for _ in 0..((1<<h)-1)/2 {
+                            output[(h as usize*2)-1] = output[(h as usize *2)-1].to_owned() + &"        ";
+                    }
+
+                    for _ in 0..(1<<h)-1 {
+                            output[h as usize*2] = output[h as usize *2].to_owned() + &"        ";
+                    }
+                }
+
+                pos += 1;
+            }
+        }
+
+        let mut s: String = "".to_string();
+        for z in (0..output.len()).rev() {
+            s = s + &output[z] + "\n";
+        }
+
+        return s;
     }
 }
 
