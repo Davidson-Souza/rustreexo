@@ -250,6 +250,19 @@ pub fn is_right_sibling(node: u64, next: u64) -> bool {
 fn is_sibling(a: u64, b: u64) -> bool {
     a ^ 1 == b
 }
+
+/// max_position_at_row returns the biggest position an accumulator can have for the
+/// requested row for the given numLeaves.
+pub fn max_position_at_row(row: u8, total_rows: u8, num_leaves: u64) -> Result<u64, String> {
+        let mut max = parent_many(num_leaves, row, total_rows).unwrap();
+
+        // We're returning the position not the leaf count so -1 here.
+        if max != 0 {
+                max -= 1
+        }
+        return Ok(max)
+}
+
 /// Returns which node should have its hashes on the proof, along with all nodes
 /// whose hashes will be calculated to reach a root
 pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) -> Vec<u64> {
