@@ -4,8 +4,8 @@
 //!
 //! # Example
 //! ```
-//! use rustreexo::accumulator::node_hash::NodeHash;
 //! use rustreexo::accumulator::mem_forest::MemForest;
+//! use rustreexo::accumulator::node_hash::NodeHash;
 //! let values = vec![0, 1, 2, 3, 4, 5, 6, 7];
 //! let hashes: Vec<NodeHash> = values
 //!     .into_iter()
@@ -266,8 +266,8 @@ impl MemForest {
     /// and the hashes that we what to prove, but sorted by position in the tree.
     /// # Example
     /// ```
-    /// use rustreexo::accumulator::node_hash::NodeHash;
     /// use rustreexo::accumulator::mem_forest::MemForest;
+    /// use rustreexo::accumulator::node_hash::NodeHash;
     /// let mut mem_forest = MemForest::new();
     /// let hashes = vec![0, 1, 2, 3, 4, 5, 6, 7]
     ///     .iter()
@@ -308,8 +308,8 @@ impl MemForest {
     /// use bitcoin_hashes::sha256::Hash as Data;
     /// use bitcoin_hashes::Hash;
     /// use bitcoin_hashes::HashEngine;
-    /// use rustreexo::accumulator::node_hash::NodeHash;
     /// use rustreexo::accumulator::mem_forest::MemForest;
+    /// use rustreexo::accumulator::node_hash::NodeHash;
     /// let values = vec![0, 1, 2, 3, 4, 5, 6, 7];
     /// let hashes = values
     ///     .into_iter()
@@ -633,8 +633,8 @@ mod test {
     use serde::Deserialize;
 
     use super::MemForest;
-    use crate::accumulator::node_hash::NodeHash;
     use crate::accumulator::mem_forest::Node;
+    use crate::accumulator::node_hash::NodeHash;
     use crate::accumulator::proof::Proof;
 
     fn hash_from_u8(value: u8) -> NodeHash {

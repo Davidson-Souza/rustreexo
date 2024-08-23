@@ -4,8 +4,8 @@
 
 use std::str::FromStr;
 
-use rustreexo::accumulator::node_hash::NodeHash;
 use rustreexo::accumulator::mem_forest::MemForest;
+use rustreexo::accumulator::node_hash::NodeHash;
 use rustreexo::accumulator::proof::Proof;
 use rustreexo::accumulator::stump::Stump;
 
