@@ -55,6 +55,7 @@
 //! assert!(s.verify(&p, &vec![hashes[0]]).expect("This proof is valid"));
 //! ```
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Read;
 use std::io::Write;
 
@@ -68,6 +69,7 @@ use super::node_hash::BitcoinNodeHash;
 use super::stump::UpdateData;
 use super::util;
 use super::util::get_proof_positions;
+use super::util::is_root_position;
 use super::util::read_u64;
 use super::util::tree_rows;
 
@@ -204,6 +206,115 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// ```
     pub fn new_with_hash(targets: Vec<u64>, hashes: Vec<Hash>) -> Self {
         Proof { targets, hashes }
+    }
+    
+    /// Computes what positions are required to prove a subset of targets.
+    ///
+    /// This is useful if you have a cache for UTXOs that were created in the last few blocks,
+    /// and just want proof for the older ones. This function will return the positions that
+    /// are required to prove each target, following the algorithm described in 
+    /// [this post](https://blog.dlsouza.lol/2024/10/24/storing_proofs.html). 
+    ///
+    /// When calling this function, you should sort the targets in descending order of age,
+    /// so older targets are first. Then you can count how many nodes there are, and request
+    /// the slice of proof from the start to n * 32, where n is the number of nodes. If you
+    /// want to validate a cache-awere proof, you can use the `calculate_roots_from_cacheable_proof`
+    /// and check if the roots are the same as the ones in the accumulator.
+    pub fn calculate_required_positions(targets: &[u64], num_leaves: u64) -> Vec<u64> {
+        let tree_rows = util::tree_rows(num_leaves);
+        let mut required = Vec::new();
+        for target in targets.iter() {
+            let mut current_pos = *target;
+            loop {
+                let sibling = current_pos ^ 1;
+                let parent = util::parent(current_pos, tree_rows);
+
+                if required.contains(&sibling) {
+                    break;
+                }
+
+                required.push(sibling);
+
+                if is_root_position(parent, num_leaves, tree_rows) {
+                    break;
+                }
+
+                current_pos = parent;
+            }
+        }
+
+        required
+    }
+    
+    /// Builds a proof for a subset of targets.
+    ///
+    /// If you're an archive node, and wants to serve proofs for a subset of the targets, you
+    /// should call this function and write exactly what it returns (in the same order) to the  
+    /// disk. If a client requests you a byte-slice, lookup exactly that many bytes in the file
+    /// and send to them.
+    pub fn create_cacheable_proof(&self, target_hashes: &[Hash], num_leaves: u64) -> Vec<Hash> {
+        let tree_rows = util::tree_rows(num_leaves);
+        let required = Self::calculate_required_positions(&self.targets, num_leaves);
+        let mut nodes = self.calculate_hashes(target_hashes, num_leaves).unwrap().0;
+
+        let proof_positions = get_proof_positions(&self.targets, num_leaves, tree_rows);
+        nodes.extend(proof_positions.into_iter().zip(self.hashes.iter().copied()));
+
+        let hashes = required
+            .iter()
+            .map(|pos| nodes.iter().find(|node| node.0 == *pos).unwrap().1)
+            .collect::<Vec<Hash>>();
+
+        hashes
+    }
+    
+    /// Computes the roots from a cache-aware proof.
+    pub fn calculate_roots_from_cacheable_proof(
+        targets: &[u64],
+        target_hashes: &[Hash],
+        proof_hashes: &[Hash],
+        num_leaves: u64,
+    ) -> Result<Vec<Hash>, String> {
+        let tree_rows = util::tree_rows(num_leaves);
+        let mut roots = HashSet::new();
+        let mut hashes_iter = proof_hashes.iter();
+        let mut target_hashes_iter = target_hashes.iter();
+        let mut visited = Vec::new();
+
+        for target in targets.iter() {
+            let mut current_pos = *target;
+            let mut current_hash = *target_hashes_iter.next().ok_or("missing proof position")?;
+
+            loop {
+                let sibling_hash = hashes_iter.next().ok_or("Missing sibling hash")?;
+
+                if current_pos & 1 == 0 {
+                    current_hash = Hash::parent_hash(&current_hash, &sibling_hash);
+                } else {
+                    current_hash = Hash::parent_hash(&sibling_hash, &current_hash);
+                }
+
+                let parent = util::parent(current_pos, tree_rows);
+                if is_root_position(parent, num_leaves, tree_rows) {
+                    roots.insert(current_hash);
+                    break;
+                }
+
+                if let Some(parent_pos) = visited.iter().position(|(pos, _)| *pos == parent) {
+                    if current_hash != visited[parent_pos].1 {
+                        return Err("Invalid proof".to_string());
+                    }
+
+                    break;
+                }
+
+                visited.push((current_pos, current_hash));
+                visited.push((current_pos ^ 1, *sibling_hash));
+
+                current_pos = parent;
+            }
+        }
+        Ok(roots.into_iter().collect())
     }
 
     /// Public interface for verifying proofs. Returns a result with a bool or an Error
@@ -1038,6 +1149,27 @@ mod tests {
             assert_eq!(stump.roots, expected_roots);
             assert_eq!(cached_hashes, expected_cached_hashes);
         }
+    }
+
+    #[test]
+    fn test_cacheable_proof() {
+        let preimages = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let hashes = preimages.into_iter().map(hash_from_u8).collect::<Vec<_>>();
+        let (stump, update_data) = Stump::new()
+            .modify(&hashes, &vec![], &Proof::default())
+            .unwrap();
+
+        let proof = Proof::default();
+        let proof = proof
+            .update(vec![], hashes.clone(), vec![], vec![1, 7], update_data)
+            .unwrap()
+            .0;
+
+        let p = proof.create_cacheable_proof(&[hashes[1], hashes[7]], 8);
+        let roots =
+            Proof::calculate_roots_from_cacheable_proof(&[1, 7], &[hashes[1], hashes[7]], &p, 8)
+                .unwrap();
+        assert_eq!(roots, stump.roots);
     }
 
     #[test]
