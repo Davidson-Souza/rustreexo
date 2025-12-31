@@ -50,7 +50,7 @@
 //!     hashes.push(sha256::Hash::from_engine(engine).into())
 //! }
 //! // Add the UTXOs to the accumulator
-//! let s = s.modify(&hashes, &vec![], &Proof::default()).unwrap().0;
+//! let s = s.modify(&hashes, &vec![], &Proof::default()).unwrap();
 //! // Create a proof for the targets
 //! let p = Proof::new(targets, proof_hashes);
 //! // Verify the proof
@@ -76,6 +76,8 @@ use super::util::get_proof_positions;
 use super::util::read_u64;
 use super::util::tree_rows;
 use crate::prelude::*;
+#[cfg(doc)]
+use crate::stump::Stump;
 use crate::util::translate;
 use crate::MAX_FOREST_ROWS;
 
@@ -186,7 +188,7 @@ pub(crate) type NodesAndRootsCurrent<Hash> = (Vec<(u64, Hash)>, Vec<Hash>);
 /// This is used when we need to return the nodes and roots for a proof
 /// if we are concerned with deleting those elements. The difference is that
 /// we need to retun the old and updatated roots in the accumulator.
-pub(crate) type NodesAndRootsOldNew<Hash> = (Vec<(u64, Hash)>, Vec<(Hash, Hash)>);
+pub(crate) type RootsOldNew<Hash> = Vec<(Hash, Hash)>;
 
 impl Proof {
     /// Creates a proof from a vector of target and hashes.
@@ -323,7 +325,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     ///     engine.input(&[i]);
     ///     hashes.push(sha256::Hash::from_engine(engine).into())
     /// }
-    /// let s = s.modify(&hashes, &vec![], &Proof::default()).unwrap().0;
+    /// let s = s.modify(&hashes, &vec![], &Proof::default()).unwrap();
     /// let p = Proof::new(targets, proof_hashes);
     /// assert!(s.verify(&p, &[hashes[0]]).expect("This proof is valid"));
     /// ```
@@ -484,8 +486,8 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// This function computes a set of roots from the proof
     ///
     /// It will compute all roots that contains elements in the proof, by hasing the nodes
-    /// in the path to the root. This function returns the calculated roots and the hashes
-    /// that were calculated in the process.
+    /// in the path to the root.
+    ///
     /// This function is used for updating the accumulator **and** verifying proofs. It returns
     /// the roots computed from the proof (that should be equal to some roots in the present
     /// accumulator) and the hashes for a accumulator where the proof elements are removed.
@@ -494,7 +496,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         &self,
         del_hashes: &[(Hash, Hash)],
         num_leaves: u64,
-    ) -> Result<NodesAndRootsOldNew<Hash>, ProofError> {
+    ) -> Result<RootsOldNew<Hash>, ProofError> {
         if self.targets.len() != del_hashes.len() {
             return Err(ProofError::DelHashesTargetsMismatch {
                 targets: self.targets.len(),
@@ -567,13 +569,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             computed.push((parent, (old_parent_hash, parent_hash)));
         }
 
-        // we shouldn't return the hashes in the proof
-        nodes.extend(computed);
-        let nodes = nodes
-            .into_iter()
-            .map(|(pos, (_, new_hash))| (pos, new_hash))
-            .collect();
-        Ok((nodes, calculated_root_hashes))
+        Ok(calculated_root_hashes)
     }
 
     /// This function computes a set of roots from a proof.
@@ -583,7 +579,9 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// hashes that were calculated in the process.
     /// This differs from `calculate_hashes_delelte` as this one is only used for verifying
     /// proofs, it doesn't compute the roots after the deletion, only the roots that are
-    /// needed for verification (i.e. the current accumulator).
+    /// needed for verification (i.e. the current accumulator). `calculate_hashes_delete` also
+    /// doesn't return hashes that were calculated, as we won't need them for updating the
+    /// accumulator.
     pub(crate) fn calculate_hashes(
         &self,
         del_hashes: &[Hash],
@@ -650,7 +648,13 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
                 return Err(ProofError::MissingSibling(next_pos));
             }
 
-            let parent_hash = AccumulatorHash::parent_hash(&next_hash, &sibling_hash);
+            let parent_hash = match (next_hash.is_empty(), sibling_hash.is_empty()) {
+                (true, true) => AccumulatorHash::empty(),
+                (true, false) => sibling_hash,
+                (false, true) => next_hash,
+                (false, false) => AccumulatorHash::parent_hash(&next_hash, &sibling_hash),
+            };
+
             let parent = util::parent(next_pos, total_rows);
             computed.push((parent, parent_hash));
         }
@@ -1096,7 +1100,10 @@ mod tests {
 
             let block_proof =
                 Proof::new(case_values.update.proof.targets.clone(), block_proof_hashes);
-            let (stump, updated) = stump.modify(&utxos, &del_hashes, &block_proof).unwrap();
+            let new_stump = stump.modify(&utxos, &del_hashes, &block_proof).unwrap();
+            let updated = stump
+                .get_update_data(&utxos, &del_hashes, &block_proof)
+                .unwrap();
             let (cached_proof, cached_hashes) = cached_proof
                 .update(
                     cached_hashes.clone(),
@@ -1107,7 +1114,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let res = stump.verify(&cached_proof, &cached_hashes);
+            let res = new_stump.verify(&cached_proof, &cached_hashes);
 
             let expected_roots: Vec<_> = case_values
                 .expected_roots
@@ -1122,7 +1129,7 @@ mod tests {
                 .collect();
             assert_eq!(res, Ok(true));
             assert_eq!(cached_proof.targets, case_values.expected_targets);
-            assert_eq!(stump.roots, expected_roots);
+            assert_eq!(new_stump.roots, expected_roots);
             assert_eq!(cached_hashes, expected_cached_hashes);
         }
     }
@@ -1282,7 +1289,7 @@ mod tests {
     fn test_update_proof_delete() {
         let preimages = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let hashes = preimages.into_iter().map(hash_from_u8).collect::<Vec<_>>();
-        let (stump, _) = Stump::new()
+        let stump = Stump::new()
             .modify(&hashes, &[], &Proof::default())
             .unwrap();
 
@@ -1310,13 +1317,22 @@ mod tests {
 
         let proof = Proof::new(vec![1, 2, 6], proof_hashes);
 
-        let (stump, modified) = stump
+        let new_stump = stump
             .modify(
                 &[],
                 &[hash_from_u8(1), hash_from_u8(2), hash_from_u8(6)],
                 &proof,
             )
             .unwrap();
+
+        let modified = stump
+            .get_update_data(
+                &[],
+                &[hash_from_u8(1), hash_from_u8(2), hash_from_u8(6)],
+                &proof,
+            )
+            .unwrap();
+
         let (new_proof, _) = cached_proof
             .update_proof_remove(
                 vec![1, 2, 6],
@@ -1326,7 +1342,7 @@ mod tests {
             )
             .unwrap();
 
-        let res = stump.verify(&new_proof, &[hash_from_u8(0), hash_from_u8(7)]);
+        let res = new_stump.verify(&new_proof, &[hash_from_u8(0), hash_from_u8(7)]);
         assert_eq!(res, Ok(true));
     }
 
@@ -1339,8 +1355,7 @@ mod tests {
         // Create a new stump with 8 leaves and 1 root
         let s = Stump::new()
             .modify(&hashes, &[], &Proof::default())
-            .expect("This stump is valid")
-            .0;
+            .expect("This stump is valid");
 
         // Nodes that will be deleted
         let del_hashes = vec![hashes[0], hashes[2], hashes[4], hashes[6]];
@@ -1432,35 +1447,18 @@ mod tests {
             .map(|hash| (hash, BitcoinNodeHash::empty()))
             .collect::<Vec<_>>();
 
-        let (computed, roots) = p.calculate_hashes_delete(&del_hashes, 8).unwrap();
+        let roots = p.calculate_hashes_delete(&del_hashes, 8).unwrap();
         let expected_root_old = BitcoinNodeHash::from_str(
             "b151a956139bb821d4effa34ea95c17560e0135d1e4661fc23cedc3af49dac42",
         )
         .unwrap();
+
         let expected_root_new = BitcoinNodeHash::from_str(
             "726fdd3b432cc59e68487d126e70f0db74a236267f8daeae30b31839a4e7ebed",
         )
         .unwrap();
 
-        let computed_positions = [0_u64, 1, 9, 13, 8, 12, 14].to_vec();
-        let computed_hashes = [
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
-            "9576f4ade6e9bc3a6458b506ce3e4e890df29cb14cb5d3d887672aef55647a2b",
-            "29590a14c1b09384b94a2c0e94bf821ca75b62eacebc47893397ca88e3bbcbd7",
-            "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
-            "2b77298feac78ab51bc5079099a074c6d789bd350442f5079fcba2b3402694e5",
-            "726fdd3b432cc59e68487d126e70f0db74a236267f8daeae30b31839a4e7ebed",
-        ]
-        .iter()
-        .map(|hash| BitcoinNodeHash::from_str(hash).unwrap())
-        .collect::<Vec<_>>();
-        let expected_computed: Vec<_> = computed_positions
-            .into_iter()
-            .zip(computed_hashes)
-            .collect();
         assert_eq!(roots, vec![(expected_root_old, expected_root_new)]);
-        assert_eq!(computed, expected_computed);
     }
 
     #[test]
@@ -1482,8 +1480,7 @@ mod tests {
         // Create a new stump with 8 leaves and 1 root
         let s = Stump::new()
             .modify(&hashes, &[], &Proof::default())
-            .expect("This stump is valid")
-            .0;
+            .expect("This stump is valid");
 
         // Nodes that will be deleted
         let del_hashes = vec![hashes[0], hashes[2], hashes[4], hashes[6]];
