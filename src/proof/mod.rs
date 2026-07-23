@@ -73,11 +73,13 @@ use super::node_hash::BitcoinNodeHash;
 use super::stump::UpdateData;
 use super::util;
 use super::util::get_proof_positions;
+use super::util::read_bounded_len;
 use super::util::read_u64;
 use super::util::tree_rows;
 use crate::prelude::*;
 use crate::util::translate;
 use crate::MAX_FOREST_ROWS;
+use crate::MAX_PROOF_DESERIALIZE_COUNT;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Errors that can occur when working with a [Proof].
@@ -90,6 +92,9 @@ pub enum ProofError {
 
     /// A hash could not be parsed during deserialization.
     InvalidHash,
+
+    /// A length prefix claimed more elements than allowed during deserialization.
+    OversizedAllocation { requested: u64, max: u64 },
 
     /// The computed roots don't match current accumulator.
     RootsMismatch,
@@ -110,6 +115,9 @@ impl fmt::Display for ProofError {
             Self::Io(kind) => write!(f, "I/O error: {kind:?}"),
             Self::InvalidTarget => write!(f, "failed to parse proof target"),
             Self::InvalidHash => write!(f, "failed to parse proof hash"),
+            Self::OversizedAllocation { requested, max } => {
+                write!(f, "oversized allocation: requested {requested}, max {max}")
+            }
             Self::MissingSibling(pos) => write!(f, "missing sibling for node at position {pos}"),
             Self::MissingProofHash(pos) => {
                 write!(f, "missing proof hash for position {pos}")
@@ -416,6 +424,11 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// - targets (u64)
     /// - number of hashes (u64)
     /// - hashes (32 bytes)
+    ///
+    /// Does **not** enforce the target/hash caps used by [`Self::deserialize`].
+    /// A proof built in memory with more elements than those caps can serialize
+    /// successfully and then fail to deserialize.
+    ///
     /// # Example
     /// ```
     /// use rustreexo::node_hash::BitcoinNodeHash;
@@ -447,6 +460,14 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     }
 
     /// Deserializes a proof from a byte array.
+    ///
+    /// Length prefixes are checked against
+    /// [`crate::MAX_PROOF_DESERIALIZE_COUNT`] before any `Vec` allocation, so a
+    /// hostile payload cannot OOM the process by claiming a huge count.
+    ///
+    /// That limit is a fixed ~4 GiB DoS bound on deserialize only. Oversized
+    /// prefixes return [`ProofError::OversizedAllocation`]. See [`Self::serialize`].
+    ///
     /// # Example
     /// ```
     /// use rustreexo::node_hash::BitcoinNodeHash;
@@ -459,14 +480,13 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// assert_eq!(Proof::default(), deserialized_proof);
     /// ```
     pub fn deserialize<Source: Read>(mut buf: Source) -> Result<Self, ProofError> {
-        let targets_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))? as usize;
-
+        let targets_len = read_bounded_len(&mut buf, MAX_PROOF_DESERIALIZE_COUNT)?;
         let mut targets = Vec::with_capacity(targets_len);
         for _ in 0..targets_len {
             targets.push(read_u64(&mut buf).map_err(|_| ProofError::InvalidTarget)?);
         }
 
-        let hashes_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))? as usize;
+        let hashes_len = read_bounded_len(&mut buf, MAX_PROOF_DESERIALIZE_COUNT)?;
         let mut hashes = Vec::with_capacity(hashes_len);
         for _ in 0..hashes_len {
             let hash = Hash::read(&mut buf).map_err(|_| ProofError::InvalidHash)?;
@@ -988,6 +1008,7 @@ mod tests {
     use crate::node_hash::BitcoinNodeHash;
     use crate::stump::Stump;
     use crate::util::hash_from_u8;
+    use crate::MAX_PROOF_DESERIALIZE_COUNT;
 
     #[derive(Deserialize)]
     struct TestCase {
@@ -1461,6 +1482,36 @@ mod tests {
             .collect();
         assert_eq!(roots, vec![(expected_root_old, expected_root_new)]);
         assert_eq!(computed, expected_computed);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_excessive_target_count() {
+        let mut buf = vec![];
+        buf.extend_from_slice(&(u64::MAX).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let res = Proof::<BitcoinNodeHash>::deserialize(buf.as_slice());
+        assert_eq!(
+            res,
+            Err(ProofError::OversizedAllocation {
+                requested: u64::MAX,
+                max: MAX_PROOF_DESERIALIZE_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_excessive_hash_count() {
+        let mut buf = vec![];
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&(MAX_PROOF_DESERIALIZE_COUNT + 1).to_le_bytes());
+        let res = Proof::<BitcoinNodeHash>::deserialize(buf.as_slice());
+        assert_eq!(
+            res,
+            Err(ProofError::OversizedAllocation {
+                requested: MAX_PROOF_DESERIALIZE_COUNT + 1,
+                max: MAX_PROOF_DESERIALIZE_COUNT,
+            })
+        );
     }
 
     #[test]

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use alloc::collections::BTreeSet;
+use core::convert::TryFrom;
 
 // Rustreexo
 use super::node_hash::AccumulatorHash;
 use crate::prelude::*;
+use crate::proof::ProofError;
 
 // isRootPosition checks if the current position is a root given the number of
 // leaves and the entire rows of the forest.
@@ -29,6 +31,16 @@ pub fn remove_bit(val: u64, bit: u64) -> u64 {
     let lower = val & lower_mask;
 
     (upper >> 1) | lower
+}
+
+/// Reads little-endian `u64` length, rejects values above `max`, converts to `usize`.
+pub(crate) fn read_bounded_len<R: Read>(reader: &mut R, max: u64) -> Result<usize, ProofError> {
+    let n = read_u64(reader).map_err(|e| ProofError::Io(e.kind()))?;
+    if n > max {
+        return Err(ProofError::OversizedAllocation { requested: n, max });
+    }
+
+    usize::try_from(n).map_err(|_| ProofError::OversizedAllocation { requested: n, max })
 }
 
 /// Translates targets from a forest with `from_rows` to a forest with `to_rows`.
