@@ -89,6 +89,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-consensus-encoding"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2d6094e2a1ba3c93b5a596fe5a10d1a10c3c6e06785cde89f693a044c01aa40"
+dependencies = [
+ "bitcoin-internals",
+]
+
+[[package]]
 name = "bitcoin-internals"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -103,9 +112,9 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6fb823712b12e5cfccdb9a2b6a62de2dc42ddb5ec489511025eebeba1c21829"
 dependencies = [
- "bitcoin-consensus-encoding",
+ "bitcoin-consensus-encoding 0.1.0",
  "bitcoin-internals",
- "bitcoin_hashes",
+ "bitcoin_hashes 0.20.0",
 ]
 
 [[package]]
@@ -114,9 +123,20 @@ version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8a45c2b41c457a9a9e4670422fcbdf109afb3b22bc920b4045e8bdfd788a3d"
 dependencies = [
- "bitcoin-consensus-encoding",
+ "bitcoin-consensus-encoding 0.1.0",
  "bitcoin-internals",
  "hex-conservative 0.3.0",
+]
+
+[[package]]
+name = "bitcoin_hashes"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f70c29ac06e7effa19682e91318deae86bdb46c4fd1bbd0f12fd196ff427ab0"
+dependencies = [
+ "bitcoin-consensus-encoding 1.0.0",
+ "bitcoin-internals",
+ "hex-conservative 1.1.0",
 ]
 
 [[package]]
@@ -373,9 +393,12 @@ dependencies = [
 
 [[package]]
 name = "hex-conservative"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ee770c000993d17c185713463d5ebfbd1af9afae4c17cc295640104383bfbf0"
+checksum = "a7289f6b628ce69fb1a371d0fdcf8ff38cd93ec00e3010eb055d1e044998c8d1"
+dependencies = [
+ "arrayvec",
+]
 
 [[package]]
 name = "io-lifetimes"
@@ -658,7 +681,7 @@ name = "rustreexo"
 version = "0.6.0"
 dependencies = [
  "bitcoin-io",
- "bitcoin_hashes",
+ "bitcoin_hashes 1.0.0",
  "bumpalo",
  "clap",
  "clap_builder",
@@ -668,7 +691,7 @@ dependencies = [
  "errno-dragonfly",
  "foldhash",
  "hashbrown",
- "hex-conservative 1.0.0",
+ "hex-conservative 1.1.0",
  "rand",
  "rayon",
  "regex",
