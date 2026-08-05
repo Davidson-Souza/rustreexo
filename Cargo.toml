@@ -18,8 +18,8 @@ std = ["bitcoin_hashes/std", "hex-conservative/std", "hashbrown/default-hasher"]
 with-serde = ["serde"]
 
 [dependencies]
-bitcoin_hashes = { version = "0.20", default-features = false }
-hex-conservative = { version = "1", default-features = false }
+bitcoin_hashes = { version = "1.0.0", default-features = false }
+hex-conservative = { version = "1.1.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 hashbrown = { version = "0.16.1", default-features = false }
 bitcoin-io = { version = "0.5.0", default-features = false, features = ["alloc"] }
@@ -98,4 +98,6 @@ examples = [
 # Allow packages of different versions in the dependency tree.
 [package.metadata.rbmt.lint]
 allowed_duplicates = [
+    "bitcoin-consensus-encoding",
+    "bitcoin-internals"
 ]
