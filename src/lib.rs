@@ -53,6 +53,17 @@ extern crate alloc;
 /// That should save you the trouble.
 pub(crate) const MAX_FOREST_ROWS: u8 = 63;
 
+/// Maximum number of targets **or** proof hashes accepted by
+/// [`proof::Proof::deserialize`].
+///
+/// Untrusted length prefixes are checked against this value before
+/// `Vec::with_capacity`, so a hostile payload cannot force an enormous
+/// reservation and OOM the process. The bound is intentionally large and
+/// fixed (~4 GiB of 32-byte hashes: `(4 * 1024³) / 32 == 1 << 27`).
+/// The same count applies to targets (`u64`). [`proof::Proof::serialize`]
+/// and in-memory construction are uncapped.
+pub const MAX_PROOF_DESERIALIZE_COUNT: u64 = (4u64 * 1024 * 1024 * 1024) / 32;
+
 #[cfg(not(feature = "std"))]
 /// Re-exports `alloc` basics plus HashMap/HashSet and IO traits.
 pub mod prelude {
