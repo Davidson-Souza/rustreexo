@@ -42,7 +42,6 @@ use alloc::rc::Weak;
 use core::array;
 use core::cell::Cell;
 use core::cell::RefCell;
-use core::convert::TryInto;
 use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Display;
@@ -52,7 +51,6 @@ use super::node_hash::AccumulatorHash;
 use super::proof::Proof;
 use super::stump::Stump;
 use super::util::detect_row;
-use super::util::detwin;
 use super::util::get_proof_positions;
 use super::util::is_root_populated;
 use super::util::is_root_position;
@@ -66,7 +64,7 @@ use crate::prelude::*;
 use crate::util::translate;
 use crate::MAX_FOREST_ROWS;
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 /// A node in the Pollard tree
 struct PollardNode<Hash: AccumulatorHash> {
     /// Whether we should remember this node or not
@@ -75,7 +73,7 @@ struct PollardNode<Hash: AccumulatorHash> {
     /// generate a proof for it. If this is not set, we can delete this node and all of its
     /// descendants, as we don't need them anymore. For internal nodes, remember is based on
     /// whether any of the nieces have remember set. For leaves, the user sets this value.
-    remember: bool,
+    remember: Cell<bool>,
     /// The hash of this node
     ///
     /// This is the hash used in the merkle proof. For leaves, this is the hash of the value
@@ -107,6 +105,8 @@ struct PollardNode<Hash: AccumulatorHash> {
     /// need to either prune the nieces, or swap them if this node is a root. If this node is a
     /// leaf, this value is `None`, as it doesn't have any descendants.
     right_niece: RefCell<Option<Rc<Self>>>,
+    /// Shared count of live Pollard node allocations.
+    node_count: Rc<Cell<usize>>,
 }
 
 pub enum PollardError<Hash: AccumulatorHash> {
@@ -228,13 +228,24 @@ impl<Hash: AccumulatorHash> Eq for PollardNode<Hash> {}
 
 impl<Hash: AccumulatorHash> PollardNode<Hash> {
     /// Creates a new PollardNode with the given hash and remember value
-    fn new(hash: Hash, remember: bool) -> Rc<Self> {
+    fn new(hash: Hash, remember: bool, node_count: &Rc<Cell<usize>>) -> Rc<Self> {
+        Self::new_with_ancestor(hash, remember, None, node_count)
+    }
+
+    fn new_with_ancestor(
+        hash: Hash,
+        remember: bool,
+        ancestor: Option<Weak<Self>>,
+        node_count: &Rc<Cell<usize>>,
+    ) -> Rc<Self> {
+        node_count.set(node_count.get() + 1);
         Rc::new(Self {
-            remember,
+            remember: Cell::new(remember),
             hash: Cell::new(hash),
-            aunt: RefCell::new(None),
+            aunt: RefCell::new(ancestor),
             left_niece: RefCell::new(None),
             right_niece: RefCell::new(None),
+            node_count: Rc::clone(node_count),
         })
     }
 
@@ -262,6 +273,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
         reader: &mut R,
         ancestor: Option<Weak<Self>>,
         leaf_map: &mut HashMap<Hash, Weak<Self>>,
+        node_count: &Rc<Cell<usize>>,
     ) -> Result<Rc<Self>, PollardError<Hash>> {
         let mut is_leaf = [0u8; 1];
         reader.read_exact(&mut is_leaf)?;
@@ -271,30 +283,16 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
         let hash = Hash::read(reader)?;
 
         if is_leaf == 1 {
-            let node = Rc::new(Self {
-                remember: true,
-                hash: Cell::new(hash),
-                aunt: RefCell::new(ancestor),
-                left_niece: RefCell::new(None),
-                right_niece: RefCell::new(None),
-            });
-
+            let node = Self::new_with_ancestor(hash, true, ancestor, node_count);
             leaf_map.insert(hash, Rc::downgrade(&node));
             return Ok(node);
         }
 
-        let node = Rc::new(Self {
-            remember: true,
-            hash: Cell::new(hash),
-            aunt: RefCell::new(ancestor),
-            left_niece: RefCell::new(None),
-            right_niece: RefCell::new(None),
-        });
-
+        let node = Self::new_with_ancestor(hash, true, ancestor, node_count);
         let node_weak = Rc::downgrade(&node);
 
-        let left = Self::deserialize(reader, Some(node_weak.clone()), leaf_map)?;
-        let right = Self::deserialize(reader, Some(node_weak), leaf_map)?;
+        let left = Self::deserialize(reader, Some(node_weak.clone()), leaf_map, node_count)?;
+        let right = Self::deserialize(reader, Some(node_weak), leaf_map, node_count)?;
 
         node.left_niece.replace(Some(left));
         node.right_niece.replace(Some(right));
@@ -330,7 +328,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
             (Some(left), Some(right)) => left.should_remember() || right.should_remember(),
             (Some(left), None) => left.should_remember(),
             (None, Some(right)) => right.should_remember(),
-            (None, None) => self.remember,
+            (None, None) => self.remember.get(),
         }
     }
 
@@ -377,6 +375,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
     ///
     /// This function will walk up the tree and recompute the hashes for each node. We may need
     /// this if we delete a node, and we need to update the hashes of the ancestors.
+    #[cfg(test)]
     fn recompute_hashes(&self) {
         if let Some((left, right)) = self.children() {
             let new_hash = Hash::parent_hash(&left.hash(), &right.hash());
@@ -426,6 +425,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
     /// This function does exactly that. It moves this node up the tree, and updates the hashes
     /// of the ancestors to reflect the new subtree (in the example above, the hash of `06` would
     /// be updated to the hash of 04 and 02).
+    #[cfg(test)]
     fn migrate_up(&self) -> Result<(), PollardError<Hash>> {
         let aunt = self.aunt().ok_or(PollardError::AuntNotFound)?;
         let grandparent = aunt.aunt().ok_or(PollardError::AuntNotFound)?;
@@ -460,8 +460,8 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
 
         // update my own aunt
         self.set_aunt(Rc::downgrade(&grandparent));
-
         aunt.prune();
+
         // I'm now my aunt's sibling, so I should have their children.
         // Update my nieces's aunt to be me
         if let Some(x) = parent.left_niece() {
@@ -493,6 +493,24 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
         self.left_niece.replace(None);
         self.right_niece.replace(None);
     }
+    fn forget(&self) {
+        self.remember.set(false);
+    }
+
+    fn prune_unremembered(&self) -> bool {
+        let left = self.left_niece();
+        let right = self.right_niece();
+        let had_nieces = left.is_some() || right.is_some();
+        let left_remembered = left.as_ref().is_some_and(|node| node.prune_unremembered());
+        let right_remembered = right.as_ref().is_some_and(|node| node.prune_unremembered());
+        if had_nieces {
+            self.remember.set(false);
+        }
+        if !left_remembered && !right_remembered {
+            self.prune();
+        }
+        self.remember.get() || left_remembered || right_remembered
+    }
 
     /// Swaps the nieces of this node with the nieces of the provided node
     ///
@@ -523,6 +541,11 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
     /// If this node is a leaf, this function should return `None`, as leaves don't have nieces.
     fn right_niece(&self) -> Option<Rc<Self>> {
         self.right_niece.borrow().clone()
+    }
+}
+impl<Hash: AccumulatorHash> Drop for PollardNode<Hash> {
+    fn drop(&mut self) {
+        self.node_count.set(self.node_count.get().saturating_sub(1));
     }
 }
 
@@ -558,6 +581,16 @@ pub struct Pollard<Hash: AccumulatorHash> {
     /// the number of leaves when it was added, so we can always find a leaf by it's position.
     leaves: u64,
     leaf_map: HashMap<Hash, Weak<PollardNode<Hash>>>,
+    /// Position-addressed hashes retained independently of the sparse pointer tree.
+    position_cache: HashMap<u64, Hash>,
+    /// Position-addressed hashes for remembered stable leaves.
+    leaf_hashes: HashMap<u64, Hash>,
+    /// Stable bottom-row positions for remembered leaves.
+    leaf_positions: HashMap<Hash, u64>,
+    /// Shared count of live node allocations reachable by this Pollard and its clones.
+    node_count: Rc<Cell<usize>>,
+    /// Number of previously uncached positions ingested through [`Self::ingest_positions`].
+    ingested_positions: u64,
 }
 
 impl<Hash: AccumulatorHash> PartialEq for Pollard<Hash> {
@@ -600,6 +633,155 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     pub fn leaves(&self) -> u64 {
         self.leaves
     }
+    /// Return the number of live node allocations backing this [Pollard].
+    pub fn cached_nodes(&self) -> usize {
+        self.node_count.get()
+    }
+
+    /// Return how many previously uncached positions were explicitly ingested.
+    pub fn ingested_positions(&self) -> u64 {
+        self.ingested_positions
+    }
+
+    /// Estimate the heap bytes retained by Pollard nodes and lookup maps.
+    pub fn estimated_memory_usage(&self) -> usize {
+        self.estimated_memory_usage_with_map_entries(
+            self.leaf_map.capacity(),
+            self.position_cache.capacity(),
+            self.leaf_hashes.capacity(),
+            self.leaf_positions.capacity(),
+        )
+    }
+    /// Estimate retained bytes after shrinking lookup maps to their current entries.
+    pub fn estimated_compact_memory_usage(&self) -> usize {
+        self.estimated_memory_usage_with_map_entries(
+            self.leaf_map.len(),
+            self.position_cache.len(),
+            self.leaf_hashes.len(),
+            self.leaf_positions.len(),
+        )
+    }
+    /// Release unused capacity in lookup maps.
+    pub fn shrink_to_fit(&mut self) {
+        self.leaf_map.shrink_to_fit();
+        self.position_cache.shrink_to_fit();
+        self.leaf_hashes.shrink_to_fit();
+        self.leaf_positions.shrink_to_fit();
+    }
+    fn estimated_memory_usage_with_map_entries(
+        &self,
+        leaf_map_entries: usize,
+        position_entries: usize,
+        leaf_hash_entries: usize,
+        leaf_position_entries: usize,
+    ) -> usize {
+        let node_bytes =
+            mem::size_of::<PollardNode<Hash>>().saturating_add(2 * mem::size_of::<usize>());
+        let leaf_map_entry_bytes = mem::size_of::<Hash>()
+            .saturating_add(mem::size_of::<Weak<PollardNode<Hash>>>())
+            .saturating_add(1);
+        let position_entry_bytes = mem::size_of::<u64>()
+            .saturating_add(mem::size_of::<Hash>())
+            .saturating_add(1);
+        let leaf_hash_entry_bytes = mem::size_of::<u64>()
+            .saturating_add(mem::size_of::<Hash>())
+            .saturating_add(1);
+        let leaf_position_entry_bytes = mem::size_of::<Hash>()
+            .saturating_add(mem::size_of::<u64>())
+            .saturating_add(1);
+        mem::size_of::<Self>()
+            .saturating_add(self.cached_nodes().saturating_mul(node_bytes))
+            .saturating_add(leaf_map_entries.saturating_mul(leaf_map_entry_bytes))
+            .saturating_add(position_entries.saturating_mul(position_entry_bytes))
+            .saturating_add(leaf_hash_entries.saturating_mul(leaf_hash_entry_bytes))
+            .saturating_add(leaf_position_entries.saturating_mul(leaf_position_entry_bytes))
+    }
+
+    /// Return whether a position is currently cached.
+    pub fn contains_position(&self, position: u64) -> bool {
+        self.position_cache.contains_key(&position)
+            || self.leaf_hashes.contains_key(&position)
+            || self.grab_position(position).is_some()
+    }
+
+    /// Return the hash at a cached position.
+    pub fn position_hash(&self, position: u64) -> Option<Hash> {
+        self.position_cache
+            .get(&position)
+            .or_else(|| self.leaf_hashes.get(&position))
+            .copied()
+            .or_else(|| self.get_hash(position).ok())
+    }
+
+    /// Return a remembered leaf's stable bottom-row position.
+    pub fn leaf_position(&self, leaf: &Hash) -> Option<u64> {
+        self.leaf_positions.get(leaf).copied()
+    }
+
+    /// Return target and proof positions that are not currently cached.
+    ///
+    /// Positions use the canonical forest rows implied by [`Self::leaves`]. The returned values
+    /// are sorted and deduplicated so callers can issue position-addressed reads directly.
+    pub fn missing_positions(&self, targets: &[u64]) -> Vec<u64> {
+        let forest_rows = tree_rows(self.leaves);
+        let mut positions = targets.to_vec();
+        positions.extend(get_proof_positions(targets, self.leaves, forest_rows));
+        positions.sort_unstable();
+        positions.dedup();
+        positions.retain(|position| !self.contains_position(*position));
+        positions
+    }
+
+    /// Ingest position-addressed hashes needed to prove `targets`.
+    ///
+    /// Already cached positions may be omitted. The returned proof is verified against the current
+    /// roots before any nodes are retained.
+    pub fn ingest_positions(
+        &mut self,
+        targets: &[u64],
+        positions: &[(u64, Hash)],
+    ) -> Result<Proof<Hash>, PollardError<Hash>> {
+        let missing = self.missing_positions(targets);
+        let provided = positions.iter().copied().collect::<HashMap<_, _>>();
+        if let Some(position) = missing
+            .iter()
+            .find(|position| !provided.contains_key(*position))
+        {
+            return Err(PollardError::PositionNotFound(*position));
+        }
+
+        let position_hash = |position: u64| {
+            if let Some(hash) = self.position_hash(position) {
+                return Ok(hash);
+            }
+            provided
+                .get(&position)
+                .copied()
+                .ok_or(PollardError::PositionNotFound(position))
+        };
+        let target_hashes = targets
+            .iter()
+            .map(|position| position_hash(*position))
+            .collect::<Result<Vec<_>, _>>()?;
+        let proof_hashes = get_proof_positions(targets, self.leaves, tree_rows(self.leaves))
+            .into_iter()
+            .map(position_hash)
+            .collect::<Result<Vec<_>, _>>()?;
+        let forest_rows = tree_rows(self.leaves);
+        let proof = Proof {
+            targets: targets
+                .iter()
+                .map(|position| translate(*position, forest_rows, MAX_FOREST_ROWS))
+                .collect(),
+            hashes: proof_hashes,
+        };
+        self.verify_and_ingest(proof.clone(), &target_hashes, &proof.targets)?;
+        for position in &missing {
+            self.position_cache.insert(*position, provided[position]);
+        }
+        self.ingested_positions = self.ingested_positions.saturating_add(missing.len() as u64);
+        Ok(proof)
+    }
 
     /// Ingests a proof into the [Pollard], caching the nodes in the proof
     ///
@@ -622,7 +804,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         proof: &Proof<Hash>,
         del_hashes: &[Hash],
     ) -> Result<bool, PollardError<Hash>> {
-        let roots = self.roots();
+        let mut roots = self.roots();
+        roots.reverse();
         proof
             .verify(del_hashes, &roots, self.leaves)
             .map_err(|_| PollardError::InvalidProof)
@@ -634,7 +817,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         del_hashes: &[Hash],
         remembers: &[u64],
     ) -> Result<(), PollardError<Hash>> {
-        let roots = self.roots();
+        let mut roots = self.roots();
+        roots.reverse();
         proof
             .verify(del_hashes, &roots, self.leaves)
             .map_err(|_| PollardError::InvalidProof)
@@ -650,29 +834,41 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
 
     pub fn prune(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
-        self.prune_map(positions);
-
-        let positions = detwin(positions.to_vec(), tree_rows(self.leaves));
-        for node in positions {
-            let (node, _) = self
-                .grab_position(node)
-                .ok_or(PollardError::PositionNotFound(node))?;
-
+        for position in positions {
+            let cached_hash = self
+                .position_cache
+                .remove(position)
+                .or_else(|| self.leaf_hashes.remove(position));
+            if let Some(hash) = cached_hash {
+                if let Some(stable_position) = self.leaf_positions.remove(&hash) {
+                    self.leaf_hashes.remove(&stable_position);
+                }
+            }
+            let Some((node, _)) = self.grab_position(*position) else {
+                if cached_hash.is_some() {
+                    continue;
+                }
+                return Err(PollardError::PositionNotFound(*position));
+            };
             self.leaf_map.remove(&node.hash());
-            node.prune();
+            if let Some(stable_position) = self.leaf_positions.remove(&node.hash()) {
+                self.leaf_hashes.remove(&stable_position);
+            }
+            node.forget();
         }
-
+        for root in self.roots.iter().flatten() {
+            root.prune_unremembered();
+        }
         Ok(())
     }
 
     /// Returns the hash of all roots in the [Pollard]
     ///
-    /// The returned array contains all roots, in ascending order. You can see the row that each
-    /// root occupies by looking at which bits are set in the number of leaves in the [Pollard].
+    /// The returned array contains roots from the lowest populated row to the highest.
     pub fn roots(&self) -> Vec<Hash> {
         self.roots
             .iter()
-            .filter_map(|x| x.as_ref().map(|x| x.hash()))
+            .filter_map(|root| root.as_ref().map(|root| root.hash()))
             .collect()
     }
 
@@ -725,7 +921,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         let pos = self.get_pos(node)?;
         let hashes = self.prove_single_inner(pos)?;
-        let targets = vec![pos];
+        let targets = vec![translate(pos, tree_rows(self.leaves), MAX_FOREST_ROWS)];
 
         Ok(Proof { hashes, targets })
     }
@@ -739,37 +935,68 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     /// The deletions should be passed as a list of target positions, telling which nodes should be
     /// deleted from the accumulator. Positions that are not cached will be ignored. You should check
     /// the validity of the proof before calling this function, as it will blindly apply the changes
-    /// to the [Pollard] without validating anything.
     pub fn modify(
         &mut self,
         adds: &[PollardAddition<Hash>],
         del_hashes: &[Hash],
         proof: Proof<Hash>,
     ) -> Result<(), PollardError<Hash>> {
+        if !del_hashes.is_empty() {
+            return self.modify_stump(adds, del_hashes, &proof);
+        }
         let targets = proof.targets.clone();
         self.ingest_proof(proof, del_hashes, &targets)?;
-
-        let targets = detwin(targets, tree_rows(self.leaves));
-        let targets = targets
-            .iter()
-            .map(|x| {
-                self.grab_position(*x)
-                    .ok_or(PollardError::PositionNotFound(*x))
-            })
-            .collect::<Vec<_>>();
-
-        for del in targets {
-            self.delete_single(del?.0)?
-        }
-
-        let mut add_nodes = Vec::new();
-        let mut roots_destroyed = Vec::new();
         for node in adds {
-            let (_new_nodes, _roots_destroyed) = self.add_single(*node)?;
-            add_nodes.extend(_new_nodes);
-            roots_destroyed.extend(_roots_destroyed);
+            self.add_single(*node)?;
+        }
+        Ok(())
+    }
+
+    /// Apply an update through a [Stump] while retaining cached leaf positions.
+    pub fn modify_stump(
+        &mut self,
+        adds: &[PollardAddition<Hash>],
+        del_hashes: &[Hash],
+        proof: &Proof<Hash>,
+    ) -> Result<(), PollardError<Hash>> {
+        let old_leaves = self.leaves;
+        let mut roots = self.roots();
+        roots.reverse();
+        let stump = Stump {
+            roots,
+            leaves: old_leaves,
+        };
+        let add_hashes = adds
+            .iter()
+            .map(|addition| addition.hash)
+            .collect::<Vec<_>>();
+        let updated = stump
+            .modify(&add_hashes, del_hashes, proof)
+            .map_err(|_| PollardError::InvalidProof)?;
+
+        let mut leaf_hashes = mem::take(&mut self.leaf_hashes);
+        let mut leaf_positions = mem::take(&mut self.leaf_positions);
+        for hash in del_hashes {
+            if let Some(position) = leaf_positions.remove(hash) {
+                leaf_hashes.remove(&position);
+            }
+        }
+        for (offset, addition) in adds.iter().enumerate() {
+            if addition.remember {
+                let position = old_leaves + offset as u64;
+                leaf_hashes.insert(position, addition.hash);
+                leaf_positions.insert(addition.hash, position);
+            }
         }
 
+        let ingested_positions = self.ingested_positions;
+        let mut roots = updated.roots;
+        roots.reverse();
+        let mut reset = Self::from_roots(roots, updated.leaves);
+        reset.ingested_positions = ingested_positions;
+        reset.leaf_hashes = leaf_hashes;
+        reset.leaf_positions = leaf_positions;
+        *self = reset;
         Ok(())
     }
 
@@ -780,6 +1007,11 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             roots,
             leaves: 0,
             leaf_map: HashMap::with_hasher(Default::default()),
+            position_cache: HashMap::with_hasher(Default::default()),
+            leaf_hashes: HashMap::with_hasher(Default::default()),
+            leaf_positions: HashMap::with_hasher(Default::default()),
+            node_count: Rc::new(Cell::new(0)),
+            ingested_positions: 0,
         }
     }
 
@@ -792,23 +1024,16 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     pub fn from_roots(roots: Vec<Hash>, leaves: u64) -> Self {
         let mut pollard = Self::new();
         pollard.leaves = leaves;
-
-        let roots = (0..=63)
-            .map(|x| {
-                if is_root_populated(x, leaves) {
-                    return Some(PollardNode::<Hash>::new(*roots.get(x as usize)?, true));
-                }
-                None
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
-        Self {
-            roots,
-            leaves,
-            leaf_map: HashMap::with_hasher(Default::default()),
+        let mut roots = roots.into_iter();
+        for row in 0..64 {
+            if is_root_populated(row as u8, leaves) {
+                pollard.roots[row] = roots
+                    .next()
+                    .map(|hash| PollardNode::<Hash>::new(hash, true, &pollard.node_count));
+            }
         }
+        debug_assert!(roots.next().is_none());
+        pollard
     }
 
     /// Serializes the [Pollard] into a sync
@@ -849,6 +1074,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         let mut pollard = Self::new();
         pollard.leaves = leaves;
+        let node_count = Rc::clone(&pollard.node_count);
 
         for root in pollard.roots.iter_mut() {
             let mut marker = [0u8; 1];
@@ -860,6 +1086,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
                     reader,
                     None,
                     &mut pollard.leaf_map,
+                    &node_count,
                 )?);
             }
         }
@@ -875,13 +1102,6 @@ type AddSingleResult<T> = (Vec<(u64, T)>, Vec<usize>);
 type ChildrenTuple<Hash> = (Rc<PollardNode<Hash>>, Rc<PollardNode<Hash>>);
 
 impl<Hash: AccumulatorHash> Pollard<Hash> {
-    fn prune_map(&mut self, positions: &[u64]) {
-        for pos in positions {
-            let node = self.grab_position(*pos).unwrap().0;
-            self.leaf_map.remove(&node.hash());
-        }
-    }
-
     fn grab_position(&self, pos: u64) -> Option<ChildrenTuple<Hash>> {
         let (root, depth, bits) = Self::detect_offset(pos, self.leaves);
         let mut node = self.roots[root as usize].clone()?;
@@ -906,7 +1126,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         })
     }
 
-    fn ingest_positions(
+    fn ingest_nodes(
         &mut self,
         mut iter: impl Iterator<Item = (u64, Hash)>,
         remembers: &[u64],
@@ -915,7 +1135,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         while let Some((pos1, hash1)) = iter.next() {
             if is_root_position(pos1, self.leaves, forest_rows) {
                 let root = detect_row(pos1, forest_rows);
-                self.roots[root as usize] = Some(PollardNode::new(hash1, true));
+                self.roots[root as usize] = Some(PollardNode::new(hash1, true, &self.node_count));
                 continue;
             }
 
@@ -923,7 +1143,6 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             if pos1 != (pos2 ^ 1) {
                 return Err(PollardError::InvalidProof);
             }
-
             let aunt = parent(pos1, forest_rows);
             let aunt = self
                 .grab_position(aunt)
@@ -934,20 +1153,19 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
                 continue;
             }
 
-            let new_node = PollardNode::new(hash1, true);
-            let new_sibling = PollardNode::new(hash2, true);
+            let remember = remembers.contains(&pos1) || remembers.contains(&pos2);
+            let new_node = PollardNode::new(hash1, remember, &self.node_count);
+            let new_sibling = PollardNode::new(hash2, remember, &self.node_count);
 
             new_node.set_aunt(Rc::downgrade(&aunt));
             new_sibling.set_aunt(Rc::downgrade(&aunt));
 
-            if remembers.contains(&pos1) || remembers.contains(&pos2) {
+            if remember {
                 self.leaf_map.insert(hash1, Rc::downgrade(&new_node));
                 self.leaf_map.insert(hash2, Rc::downgrade(&new_sibling));
             }
-
             aunt.set_niece(Some(new_sibling), Some(new_node));
         }
-
         Ok(())
     }
 
@@ -959,21 +1177,29 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         recompute: bool,
     ) -> Result<(), PollardError<Hash>> {
         let forest_rows = tree_rows(self.leaves);
+        let targets = proof
+            .targets
+            .iter()
+            .map(|position| translate(*position, MAX_FOREST_ROWS, forest_rows))
+            .collect::<Vec<_>>();
+        let remembers = remembers
+            .iter()
+            .map(|position| translate(*position, MAX_FOREST_ROWS, forest_rows))
+            .collect::<Vec<_>>();
         let (mut all_nodes, _) = proof
             .calculate_hashes(del_hashes, self.leaves)
             .map_err(|_| PollardError::InvalidProof)?;
 
-        let proof_positions = get_proof_positions(&proof.targets, self.leaves, forest_rows);
+        let proof_positions = get_proof_positions(&targets, self.leaves, forest_rows);
 
         all_nodes.extend(proof_positions.into_iter().zip(proof.hashes.clone()));
         all_nodes.sort();
         let iter = all_nodes.into_iter().rev();
-        self.ingest_positions(iter, remembers)?;
+        self.ingest_nodes(iter, &remembers)?;
 
-        let pruned = proof
-            .targets
+        let pruned = targets
             .iter()
-            .filter(|x| !remembers.contains(x))
+            .filter(|position| !remembers.contains(position))
             .copied()
             .collect::<Vec<_>>();
 
@@ -1102,8 +1328,12 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         node: PollardAddition<Hash>,
     ) -> Result<AddSingleResult<Hash>, PollardError<Hash>> {
         let mut row = 0;
-        let mut new_node = PollardNode::new(node.hash, node.remember);
+        let mut new_node = PollardNode::new(node.hash, node.remember, &self.node_count);
         self.leaf_map.insert(node.hash, Rc::downgrade(&new_node));
+        if node.remember {
+            self.leaf_hashes.insert(self.leaves, node.hash);
+            self.leaf_positions.insert(node.hash, self.leaves);
+        }
 
         let mut add_positions = Vec::new();
         let mut roots_to_destroy = Vec::new();
@@ -1111,9 +1341,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         while self.leaves >> row & 1 == 1 {
             let old_root = mem::take(&mut self.roots[row as usize]).expect("Root not found");
             let pos = root_position(self.leaves(), row, tree_rows(self.leaves()));
-
             add_positions.push((pos, old_root.hash()));
-
             if old_root.hash().is_empty() {
                 let pos = row as usize;
                 self.roots[pos] = None;
@@ -1123,13 +1351,11 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             }
 
             let new_root_hash = Hash::parent_hash(&old_root.hash.get(), &new_node.hash.get());
-            let new_root_rc = Rc::new(PollardNode {
-                remember: old_root.should_remember() || new_node.should_remember(),
-                hash: Cell::new(new_root_hash),
-                aunt: RefCell::new(None),
-                left_niece: RefCell::new(None),
-                right_niece: RefCell::new(None),
-            });
+            let new_root_rc = PollardNode::new(
+                new_root_hash,
+                old_root.should_remember() || new_node.should_remember(),
+                &self.node_count,
+            );
 
             // swap nieces
             new_node.swap_nieces(&old_root);
@@ -1175,13 +1401,15 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         Ok((add_positions, roots_to_destroy))
     }
 
+    #[cfg(test)]
     fn delete_single(&mut self, node: Rc<PollardNode<Hash>>) -> Result<(), PollardError<Hash>> {
         self.leaf_map.remove(&node.hash());
-        // we are deleting a root, just write an empty hash where it was
+        self.leaf_positions.remove(&node.hash());
         if node.aunt.borrow().is_none() {
             for i in 0..64 {
                 if self.roots[i].eq(&Some(node.clone())) {
-                    self.roots[i] = Some(Rc::new(PollardNode::default()));
+                    self.roots[i] =
+                        Some(PollardNode::new(Hash::default(), false, &self.node_count));
                     return Ok(());
                 }
             }
@@ -1280,7 +1508,13 @@ impl<Hash: AccumulatorHash> From<Stump<Hash>> for Pollard<Hash> {
 mod tests {
     use core::str::FromStr;
 
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+    use rand::SeedableRng;
     use serde::Deserialize;
+
+    use crate::mem_forest::MemForest;
 
     use super::*;
     use crate::node_hash::BitcoinNodeHash;
@@ -1770,5 +2004,172 @@ mod tests {
 
         let node = acc.grab_position(3).unwrap().0;
         assert_eq!(node.hash(), hash_from_u8(3));
+    }
+    #[test]
+    fn modifies_unsorted_deletion_targets() {
+        let values = get_hashes_of(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        pollard.modify(&values, &[], Proof::default()).unwrap();
+        let deletions = [14, 1, 7, 3]
+            .iter()
+            .map(|position| hash_from_u8(*position))
+            .collect::<Vec<_>>();
+        let proof = pollard.batch_proof(&deletions).unwrap();
+
+        assert!(pollard.verify(&proof, &deletions).unwrap());
+        pollard.modify(&[], &deletions, proof).unwrap();
+    }
+
+    #[test]
+    fn differential_updates_match_stump_and_mem_forest() {
+        let mut rng = StdRng::seed_from_u64(0x5eed_5eed);
+        let mut witness = MemForest::<BitcoinNodeHash>::new_with_hash();
+        let mut stump = Stump::<BitcoinNodeHash>::new();
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        let mut live = Vec::new();
+        let mut next_leaf = 0u64;
+
+        for _ in 0..512 {
+            let mut deletion_indices = (0..live.len()).collect::<Vec<_>>();
+            deletion_indices.shuffle(&mut rng);
+            deletion_indices.truncate(rng.random_range(0..=live.len().min(4)));
+            let deletions = deletion_indices
+                .iter()
+                .map(|index| live[*index])
+                .collect::<Vec<_>>();
+            let proof = witness.prove(&deletions).unwrap();
+
+            let addition_count = rng.random_range(1..=4);
+            let mut addition_hashes = Vec::with_capacity(addition_count);
+            for _ in 0..addition_count {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&next_leaf.to_le_bytes());
+                bytes[8..16].copy_from_slice(&next_leaf.rotate_left(17).to_le_bytes());
+                addition_hashes.push(BitcoinNodeHash::from(bytes));
+                next_leaf += 1;
+            }
+            let additions = addition_hashes
+                .iter()
+                .map(|hash| PollardAddition {
+                    hash: *hash,
+                    remember: true,
+                })
+                .collect::<Vec<_>>();
+
+            stump = stump.modify(&addition_hashes, &deletions, &proof).unwrap();
+            pollard.modify(&additions, &deletions, proof).unwrap();
+            witness.modify(&addition_hashes, &deletions).unwrap();
+
+            deletion_indices.sort_unstable_by(|left, right| right.cmp(left));
+            for index in deletion_indices {
+                live.remove(index);
+            }
+            live.extend(addition_hashes);
+
+            let witness_roots = witness
+                .get_roots()
+                .iter()
+                .map(|root| root.get_data())
+                .collect::<Vec<_>>();
+            let mut pollard_roots = pollard.roots();
+            pollard_roots.reverse();
+            assert_eq!(pollard_roots, stump.roots);
+            assert_eq!(witness_roots, stump.roots);
+            assert_eq!(pollard.leaves(), stump.leaves);
+            assert_eq!(witness.leaves, stump.leaves);
+        }
+    }
+
+    #[test]
+    fn pollard_mutation_retains_internal_leaf_positions() {
+        let values = (0u8..32).collect::<Vec<_>>();
+        let additions = get_hashes_of(&values);
+        let mut full = Pollard::<BitcoinNodeHash>::new();
+        full.modify(&additions, &[], Proof::default()).unwrap();
+        let mut partial = Pollard::from_roots(full.roots(), full.leaves());
+
+        let deletions = vec![hash_from_u8(14)];
+        let proof = full.batch_proof(&deletions).unwrap();
+        let rows = tree_rows(full.leaves());
+        let targets = proof
+            .targets
+            .iter()
+            .map(|position| translate(*position, MAX_FOREST_ROWS, rows))
+            .collect::<Vec<_>>();
+        let mut positions = targets
+            .iter()
+            .copied()
+            .zip(deletions.iter().copied())
+            .collect::<Vec<_>>();
+        positions.extend(
+            get_proof_positions(&targets, full.leaves(), rows)
+                .into_iter()
+                .zip(proof.hashes.iter().copied()),
+        );
+        let proof = partial.ingest_positions(&targets, &positions).unwrap();
+        let new_additions = get_hashes_of(&[32, 33]);
+
+        let mut roots = full.roots();
+        roots.reverse();
+        let expected = Stump {
+            roots,
+            leaves: full.leaves(),
+        }
+        .modify(
+            &new_additions
+                .iter()
+                .map(|addition| addition.hash)
+                .collect::<Vec<_>>(),
+            &deletions,
+            &proof,
+        )
+        .unwrap();
+        partial.modify(&new_additions, &deletions, proof).unwrap();
+
+        let mut roots = partial.roots();
+        roots.reverse();
+        assert_eq!(roots, expected.roots);
+        assert_eq!(partial.leaves(), expected.leaves);
+        assert!(partial.position_cache.is_empty());
+        assert_eq!(partial.leaf_hashes.len(), partial.leaf_positions.len());
+        assert_eq!(partial.leaf_position(&new_additions[0].hash), Some(32));
+        assert_eq!(partial.leaf_position(&new_additions[1].hash), Some(33));
+        assert_eq!(partial.position_hash(32), Some(new_additions[0].hash));
+        assert!(!partial.missing_positions(&[32]).contains(&32));
+    }
+
+    #[test]
+    fn ingests_only_missing_position_hashes() {
+        let values = get_hashes_of(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let mut full = Pollard::<BitcoinNodeHash>::new();
+        full.modify(&values, &[], Proof::default()).unwrap();
+        let proof = full.batch_proof(&[hash_from_u8(3)]).unwrap();
+        let targets = [3];
+        let mut positions = vec![(3, hash_from_u8(3))];
+        positions.extend(
+            get_proof_positions(&targets, full.leaves(), tree_rows(full.leaves()))
+                .into_iter()
+                .zip(proof.hashes.iter().copied()),
+        );
+
+        let mut partial = Pollard::from_roots(full.roots(), full.leaves());
+        let initial_nodes = partial.cached_nodes();
+        let initial_bytes = partial.estimated_memory_usage();
+        let mut expected_missing = positions
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>();
+        expected_missing.sort_unstable();
+        assert_eq!(partial.missing_positions(&targets), expected_missing);
+
+        let ingested = partial.ingest_positions(&targets, &positions).unwrap();
+        assert_eq!(ingested, proof);
+        assert!(partial.missing_positions(&targets).is_empty());
+        assert_eq!(partial.ingested_positions(), expected_missing.len() as u64);
+        assert!(partial.cached_nodes() > initial_nodes);
+        assert!(partial.estimated_memory_usage() > initial_bytes);
+
+        partial.ingest_positions(&targets, &[]).unwrap();
+        assert_eq!(partial.ingested_positions(), expected_missing.len() as u64);
     }
 }

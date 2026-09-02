@@ -628,8 +628,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         let proof_positions = get_proof_positions(&translated, num_leaves, total_rows);
 
         // As we calculate nodes upwards, it accumulates here
-        let mut nodes: Vec<_> = self
-            .targets
+        let mut nodes: Vec<_> = translated
             .iter()
             .copied()
             .zip(del_hashes.to_owned())
