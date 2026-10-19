@@ -588,10 +588,60 @@ pub struct PollardAddition<Hash> {
     pub remember: bool,
 }
 
+/// Exact state of a node in a position-addressed backing forest.
+///
+/// Spent and unready nodes retain their hash bytes: journal before-images must not
+/// substitute an empty hash for bytes that are still present in the backing store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalNodeState<Hash> {
+    pub ready: bool,
+    pub spent: bool,
+    pub hash: Hash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PositionKind {
+    Logical,
+    Remembered,
+    Physical,
+}
+
+/// Immutable hashes shared by the position index's logical, stable-leaf and
+/// physical roles. They must not alias mutable pointer-tree hashes: ingesting a
+/// proof can recompute those without changing the physical backing forest.
+struct PositionNode<Hash> {
+    hash: Hash,
+    count: Rc<Cell<usize>>,
+}
+
+impl<Hash> PositionNode<Hash> {
+    fn new(hash: Hash, count: &Rc<Cell<usize>>) -> Rc<Self> {
+        count.set(count.get() + 1);
+        Rc::new(Self {
+            hash,
+            count: Rc::clone(count),
+        })
+    }
+}
+
+impl<Hash> Drop for PositionNode<Hash> {
+    fn drop(&mut self) {
+        self.count.set(self.count.get() - 1);
+    }
+}
+
+#[derive(Clone)]
+struct PositionEntry<Hash> {
+    node: Rc<PositionNode<Hash>>,
+    ready: bool,
+    spent: bool,
+}
+
 #[derive(Clone)]
 pub struct Pollard<Hash: AccumulatorHash> {
-    /// The roots of our [Pollard]. They are the top nodes of the tree, and they are the only nodes
-    /// that are owned by the [Pollard] itself. All other nodes are owned by their ancestors.
+    /// Roots of the mutable proof tree. Pollard owns these roots directly; their
+    /// descendants are owned by ancestors. Separately, the structural position
+    /// index owns immutable hash nodes shared across its coordinate roles.
     ///
     /// The roots are stored in an array, where the index is the row of the tree where the root is
     /// located. The first root is at index 0, and so on. The roots are stored in the array in the
@@ -606,10 +656,12 @@ pub struct Pollard<Hash: AccumulatorHash> {
     /// the number of leaves when it was added, so we can always find a leaf by it's position.
     leaves: u64,
     leaf_map: HashMap<Hash, Weak<PollardNode<Hash>>>,
-    /// Position-addressed hashes retained independently of the sparse pointer tree.
-    position_cache: HashMap<u64, Hash>,
-    /// Position-addressed hashes for remembered stable leaves.
-    leaf_hashes: HashMap<u64, Hash>,
+    /// One sparse structural index; roles distinguish compressed logical positions
+    /// from stable physical coordinates and remembered bottom-row leaves.
+    position_index: HashMap<(PositionKind, u64), PositionEntry<Hash>>,
+    position_node_count: Rc<Cell<usize>>,
+    /// Keys to invalidate without scanning potentially many retained physical nodes.
+    logical_positions: Vec<u64>,
     /// Stable bottom-row positions for remembered leaves.
     leaf_positions: HashMap<Hash, u64>,
     /// Shared count of live node allocations reachable by this Pollard and its clones.
@@ -660,7 +712,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
     /// Return the number of live node allocations backing this [Pollard].
     pub fn cached_nodes(&self) -> usize {
-        self.node_count.get()
+        self.node_count.get() + self.position_node_count.get()
     }
 
     /// Return how many previously uncached positions were explicitly ingested.
@@ -672,75 +724,209 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     pub fn estimated_memory_usage(&self) -> usize {
         self.estimated_memory_usage_with_map_entries(
             self.leaf_map.capacity(),
-            self.position_cache.capacity(),
-            self.leaf_hashes.capacity(),
+            self.position_index.capacity(),
             self.leaf_positions.capacity(),
+            self.logical_positions.capacity(),
         )
     }
     /// Estimate retained bytes after shrinking lookup maps to their current entries.
     pub fn estimated_compact_memory_usage(&self) -> usize {
         self.estimated_memory_usage_with_map_entries(
             self.leaf_map.len(),
-            self.position_cache.len(),
-            self.leaf_hashes.len(),
+            self.position_index.len(),
             self.leaf_positions.len(),
+            self.logical_positions.len(),
         )
     }
     /// Release unused capacity in lookup maps.
     pub fn shrink_to_fit(&mut self) {
         self.leaf_map.shrink_to_fit();
-        self.position_cache.shrink_to_fit();
-        self.leaf_hashes.shrink_to_fit();
+        self.position_index.shrink_to_fit();
         self.leaf_positions.shrink_to_fit();
+        self.logical_positions.shrink_to_fit();
     }
     fn estimated_memory_usage_with_map_entries(
         &self,
         leaf_map_entries: usize,
         position_entries: usize,
-        leaf_hash_entries: usize,
         leaf_position_entries: usize,
+        logical_positions: usize,
     ) -> usize {
         let node_bytes =
             mem::size_of::<PollardNode<Hash>>().saturating_add(2 * mem::size_of::<usize>());
         let leaf_map_entry_bytes = mem::size_of::<Hash>()
             .saturating_add(mem::size_of::<Weak<PollardNode<Hash>>>())
             .saturating_add(1);
-        let position_entry_bytes = mem::size_of::<u64>()
-            .saturating_add(mem::size_of::<Hash>())
+        let position_entry_bytes = mem::size_of::<(PositionKind, u64)>()
+            .saturating_add(mem::size_of::<PositionEntry<Hash>>())
             .saturating_add(1);
-        let leaf_hash_entry_bytes = mem::size_of::<u64>()
-            .saturating_add(mem::size_of::<Hash>())
-            .saturating_add(1);
+        let position_node_bytes =
+            mem::size_of::<PositionNode<Hash>>().saturating_add(2 * mem::size_of::<usize>());
         let leaf_position_entry_bytes = mem::size_of::<Hash>()
             .saturating_add(mem::size_of::<u64>())
             .saturating_add(1);
         mem::size_of::<Self>()
-            .saturating_add(self.cached_nodes().saturating_mul(node_bytes))
+            .saturating_add(self.node_count.get().saturating_mul(node_bytes))
+            .saturating_add(
+                self.position_node_count
+                    .get()
+                    .saturating_mul(position_node_bytes),
+            )
             .saturating_add(leaf_map_entries.saturating_mul(leaf_map_entry_bytes))
             .saturating_add(position_entries.saturating_mul(position_entry_bytes))
-            .saturating_add(leaf_hash_entries.saturating_mul(leaf_hash_entry_bytes))
             .saturating_add(leaf_position_entries.saturating_mul(leaf_position_entry_bytes))
+            .saturating_add(logical_positions.saturating_mul(mem::size_of::<u64>()))
     }
 
     /// Return whether a position is currently cached.
     pub fn contains_position(&self, position: u64) -> bool {
-        self.position_cache.contains_key(&position)
-            || self.leaf_hashes.contains_key(&position)
+        self.position_index
+            .contains_key(&(PositionKind::Logical, position))
+            || self
+                .position_index
+                .contains_key(&(PositionKind::Remembered, position))
             || self.grab_position(position).is_some()
     }
 
     /// Return the hash at a cached position.
     pub fn position_hash(&self, position: u64) -> Option<Hash> {
-        self.position_cache
-            .get(&position)
-            .or_else(|| self.leaf_hashes.get(&position))
-            .copied()
+        self.position_index
+            .get(&(PositionKind::Logical, position))
+            .or_else(|| {
+                self.position_index
+                    .get(&(PositionKind::Remembered, position))
+            })
+            .map(|entry| entry.node.hash)
             .or_else(|| self.get_hash(position).ok())
     }
 
     /// Return a remembered leaf's stable bottom-row position.
     pub fn leaf_position(&self, leaf: &Hash) -> Option<u64> {
         self.leaf_positions.get(leaf).copied()
+    }
+
+    /// Return a remembered leaf's hash by its stable bottom-row position.
+    ///
+    /// Unlike [`Self::position_hash`], this never resolves a compressed logical
+    /// position or a spent physical node. Cache eviction can retain only stable
+    /// positions and ages rather than duplicating remembered hashes externally.
+    pub fn remembered_leaf_hash(&self, position: u64) -> Option<Hash> {
+        self.position_index
+            .get(&(PositionKind::Remembered, position))
+            .map(|entry| entry.node.hash)
+    }
+
+    /// Read a physical backing-forest node, including its exact spent hash bytes.
+    ///
+    /// `forest_rows` describes the backing store's capacity, not the current leaf
+    /// count. Keys are normalized to fixed coordinates, so capacity growth does
+    /// not invalidate retained nodes. `None` permits a backing-store read only
+    /// when the caller has retained every write since its durable baseline.
+    pub fn physical_node(&self, position: u64, forest_rows: u8) -> Option<PhysicalNodeState<Hash>> {
+        assert!(forest_rows <= MAX_FOREST_ROWS);
+        let position = translate(position, forest_rows, MAX_FOREST_ROWS);
+        self.position_index
+            .get(&(PositionKind::Physical, position))
+            .map(|entry| PhysicalNodeState {
+                ready: entry.ready,
+                spent: entry.spent,
+                hash: entry.node.hash,
+            })
+    }
+
+    /// Retain exact physical after-images of a successful accumulator update.
+    ///
+    /// Call this before publishing writes to an asynchronous backing store, and
+    /// retain every changed position (including spent/unready nodes and old
+    /// ancestors). A later update can then obtain its before-images with
+    /// [`Self::physical_node`] without racing the backing-store writer.
+    ///
+    /// These entries survive proof ingestion, logical mutation and pruning.
+    /// They are ephemeral structural state, not part of Pollard's proof-tree
+    /// serialization. Reconstructed Pollards require a current backing store.
+    pub fn retain_physical_nodes(
+        &mut self,
+        forest_rows: u8,
+        nodes: impl IntoIterator<Item = (u64, PhysicalNodeState<Hash>)>,
+    ) {
+        assert!(forest_rows <= MAX_FOREST_ROWS);
+        for (position, state) in nodes {
+            let position = translate(position, forest_rows, MAX_FOREST_ROWS);
+            self.index_hash(
+                PositionKind::Physical,
+                position,
+                state.hash,
+                state.ready,
+                state.spent,
+            );
+        }
+    }
+
+    /// Release physical structure only after all producer updates are applied.
+    ///
+    /// The caller must publish any partial journal and wait for its backing store
+    /// to reach this Pollard's tip before calling this method, including for quota
+    /// eviction. Ordinary [`Self::prune`] deliberately cannot remove these entries.
+    pub fn clear_physical_nodes(&mut self) {
+        self.position_index
+            .retain(|(kind, _), _| *kind != PositionKind::Physical);
+    }
+
+    fn index_hash(
+        &mut self,
+        kind: PositionKind,
+        position: u64,
+        hash: Hash,
+        ready: bool,
+        spent: bool,
+    ) {
+        let rows = tree_rows(self.leaves);
+        let fixed = if kind == PositionKind::Logical {
+            translate(position, rows, MAX_FOREST_ROWS)
+        } else {
+            position
+        };
+        let logical = if detect_row(fixed, MAX_FOREST_ROWS) <= rows {
+            Some(translate(fixed, MAX_FOREST_ROWS, rows))
+        } else {
+            None
+        };
+        let node = self
+            .position_index
+            .get(&(kind, position))
+            .filter(|entry| entry.node.hash == hash)
+            .or_else(|| {
+                self.position_index
+                    .get(&(PositionKind::Physical, fixed))
+                    .filter(|entry| entry.node.hash == hash)
+            })
+            .or_else(|| {
+                self.position_index
+                    .get(&(PositionKind::Remembered, fixed))
+                    .filter(|entry| entry.node.hash == hash)
+            })
+            .or_else(|| {
+                logical.and_then(|position| {
+                    self.position_index
+                        .get(&(PositionKind::Logical, position))
+                        .filter(|entry| entry.node.hash == hash)
+                })
+            })
+            .map(|entry| Rc::clone(&entry.node))
+            .unwrap_or_else(|| PositionNode::new(hash, &self.position_node_count));
+        let previous = self
+            .position_index
+            .insert((kind, position), PositionEntry { node, ready, spent });
+        if kind == PositionKind::Logical && previous.is_none() {
+            self.logical_positions.push(position);
+        }
+    }
+
+    fn clear_logical_positions(&mut self) {
+        for position in self.logical_positions.drain(..) {
+            self.position_index
+                .remove(&(PositionKind::Logical, position));
+        }
     }
 
     /// Return target and proof positions that are not currently cached.
@@ -802,7 +988,13 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         };
         self.verify_and_ingest(&proof, &target_hashes, &proof.targets)?;
         for position in &missing {
-            self.position_cache.insert(*position, provided[position]);
+            self.index_hash(
+                PositionKind::Logical,
+                *position,
+                provided[position],
+                true,
+                false,
+            );
         }
         self.ingested_positions = self.ingested_positions.saturating_add(missing.len() as u64);
         Ok(proof)
@@ -868,12 +1060,17 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     fn prune_local(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
         for position in positions {
             let cached_hash = self
-                .position_cache
-                .remove(position)
-                .or_else(|| self.leaf_hashes.remove(position));
+                .position_index
+                .remove(&(PositionKind::Logical, *position))
+                .or_else(|| {
+                    self.position_index
+                        .remove(&(PositionKind::Remembered, *position))
+                })
+                .map(|entry| entry.node.hash);
             if let Some(hash) = cached_hash {
                 if let Some(stable_position) = self.leaf_positions.remove(&hash) {
-                    self.leaf_hashes.remove(&stable_position);
+                    self.position_index
+                        .remove(&(PositionKind::Remembered, stable_position));
                 }
             }
             let Some((node, _)) = self.grab_position(*position) else {
@@ -884,7 +1081,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             };
             self.leaf_map.remove(&node.hash());
             if let Some(stable_position) = self.leaf_positions.remove(&node.hash()) {
-                self.leaf_hashes.remove(&stable_position);
+                self.position_index
+                    .remove(&(PositionKind::Remembered, stable_position));
             }
             node.forget();
         }
@@ -978,13 +1176,19 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         }
         let targets = proof.targets.clone();
         self.ingest_proof(proof, del_hashes, &targets)?;
+        if !adds.is_empty() {
+            self.clear_logical_positions();
+        }
         for node in adds {
             self.add_single(*node);
         }
         Ok(())
     }
 
-    /// Apply an update through a [Stump] while retaining cached leaf positions.
+    /// Apply an update through a [Stump] while retaining remembered leaf positions
+    /// and physical backing-forest state. Rebuilding the mutable proof tree only
+    /// invalidates logical position entries; physical entries remain available for
+    /// reads and journal before-images until [`Self::clear_physical_nodes`].
     pub fn modify_stump(
         &mut self,
         adds: &[PollardAddition<Hash>],
@@ -1006,17 +1210,27 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             .modify(&add_hashes, del_hashes, proof)
             .map_err(|_| PollardError::InvalidProof)?;
 
-        let mut leaf_hashes = mem::take(&mut self.leaf_hashes);
+        // Physical entries are the authoritative structural state while a backing
+        // forest lags. Neither rebuilding the proof tree nor ingesting proofs may
+        // discard them. Only logical coordinates expire after a mutation.
+        self.clear_logical_positions();
         let mut leaf_positions = mem::take(&mut self.leaf_positions);
         for hash in del_hashes {
             if let Some(position) = leaf_positions.remove(hash) {
-                leaf_hashes.remove(&position);
+                self.position_index
+                    .remove(&(PositionKind::Remembered, position));
             }
         }
         for (offset, addition) in adds.iter().enumerate() {
             if addition.remember {
                 let position = old_leaves + offset as u64;
-                leaf_hashes.insert(position, addition.hash);
+                self.index_hash(
+                    PositionKind::Remembered,
+                    position,
+                    addition.hash,
+                    true,
+                    false,
+                );
                 leaf_positions.insert(addition.hash, position);
             }
         }
@@ -1026,7 +1240,9 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         roots.reverse();
         let mut reset = Self::from_roots(&roots, updated.leaves);
         reset.ingested_positions = ingested_positions;
-        reset.leaf_hashes = leaf_hashes;
+        reset.position_index = mem::take(&mut self.position_index);
+        reset.position_node_count = Rc::clone(&self.position_node_count);
+        reset.logical_positions = mem::take(&mut self.logical_positions);
         reset.leaf_positions = leaf_positions;
         *self = reset;
         Ok(())
@@ -1039,8 +1255,9 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             roots,
             leaves: 0,
             leaf_map: new_hash_map(),
-            position_cache: new_hash_map(),
-            leaf_hashes: new_hash_map(),
+            position_index: new_hash_map(),
+            position_node_count: Rc::new(Cell::new(0)),
+            logical_positions: Vec::new(),
             leaf_positions: new_hash_map(),
             node_count: Rc::new(Cell::new(0)),
             ingested_positions: 0,
@@ -1359,7 +1576,13 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let mut new_node = PollardNode::new(node.hash, node.remember, &self.node_count);
         self.leaf_map.insert(node.hash, Rc::downgrade(&new_node));
         if node.remember {
-            self.leaf_hashes.insert(self.leaves, node.hash);
+            self.index_hash(
+                PositionKind::Remembered,
+                self.leaves,
+                node.hash,
+                true,
+                false,
+            );
             self.leaf_positions.insert(node.hash, self.leaves);
         }
 
@@ -2228,8 +2451,18 @@ mod tests {
         roots.reverse();
         assert_eq!(roots, expected.roots);
         assert_eq!(partial.leaves(), expected.leaves);
-        assert!(partial.position_cache.is_empty());
-        assert_eq!(partial.leaf_hashes.len(), partial.leaf_positions.len());
+        assert!(!partial
+            .position_index
+            .keys()
+            .any(|(kind, _)| *kind == PositionKind::Logical));
+        assert_eq!(
+            partial
+                .position_index
+                .keys()
+                .filter(|(kind, _)| *kind == PositionKind::Remembered)
+                .count(),
+            partial.leaf_positions.len(),
+        );
         assert_eq!(partial.leaf_position(&new_additions[0].hash), Some(32));
         assert_eq!(partial.leaf_position(&new_additions[1].hash), Some(33));
         assert_eq!(partial.position_hash(32), Some(new_additions[0].hash));
@@ -2269,5 +2502,170 @@ mod tests {
 
         partial.ingest_positions(&targets, &[]).unwrap();
         assert_eq!(partial.ingested_positions(), expected_missing.len() as u64);
+    }
+
+    #[test]
+    fn physical_structure_survives_ingestion_mutation_and_pruning() {
+        let additions = get_hashes_of(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let mut full = Pollard::<BitcoinNodeHash>::new();
+        full.modify(&additions, &[], &Proof::default()).unwrap();
+        let deletion = hash_from_u8(0);
+        let proof = full.batch_proof(&[deletion]).unwrap();
+        let mut pollard = Pollard::from_roots(&full.roots(), full.leaves());
+        let ready = PhysicalNodeState {
+            ready: true,
+            spent: false,
+            hash: deletion,
+        };
+        let parent_before = PhysicalNodeState {
+            ready: true,
+            spent: false,
+            hash: BitcoinNodeHash::parent_hash(&hash_from_u8(0), &hash_from_u8(1)),
+        };
+        pollard.retain_physical_nodes(3, [(0, ready), (8, parent_before)]);
+        pollard
+            .verify_and_ingest(&proof, &[deletion], &proof.targets)
+            .unwrap();
+        assert_eq!(pollard.physical_node(8, 3), Some(parent_before));
+
+        let next = get_hashes_of(&[8]);
+        pollard.modify_stump(&next, &[deletion], &proof).unwrap();
+        // Root reconstruction must not lose any retained physical before-image.
+        assert_eq!(pollard.physical_node(0, 3), Some(ready));
+        assert_eq!(pollard.physical_node(8, 3), Some(parent_before));
+        let spent = PhysicalNodeState {
+            spent: true,
+            ..ready
+        };
+        let promoted = PhysicalNodeState {
+            hash: hash_from_u8(1),
+            ..parent_before
+        };
+        let added = PhysicalNodeState {
+            hash: next[0].hash,
+            ..ready
+        };
+        pollard.retain_physical_nodes(4, [(0, spent), (16, promoted), (8, added)]);
+        assert_eq!(pollard.physical_node(0, 4), Some(spent));
+        assert_eq!(pollard.physical_node(8, 3), Some(promoted));
+        assert_eq!(pollard.physical_node(16, 4), Some(promoted));
+        assert_eq!(pollard.leaf_position(&next[0].hash), Some(8));
+
+        let root_proof = Proof {
+            targets: vec![8],
+            hashes: vec![],
+        };
+        pollard
+            .verify_and_ingest(&root_proof, &[next[0].hash], &[8])
+            .unwrap();
+        pollard.prune(&[8]).unwrap();
+        assert_eq!(pollard.remembered_leaf_hash(8), None);
+        assert_eq!(pollard.physical_node(8, 4), Some(added));
+        assert_eq!(pollard.physical_node(16, 4), Some(promoted));
+
+        // A second mutation also preserves old spent bytes and promoted ancestors.
+        pollard.modify_stump(&[], &[], &Proof::default()).unwrap();
+        assert_eq!(pollard.physical_node(0, 4), Some(spent));
+        assert_eq!(pollard.physical_node(16, 4), Some(promoted));
+        assert_eq!(pollard.physical_node(3, 4), None);
+        pollard.clear_physical_nodes();
+        assert_eq!(pollard.physical_node(0, 4), None);
+        assert_eq!(pollard.physical_node(16, 4), None);
+    }
+
+    #[test]
+    fn physical_index_shares_hashes_and_accounts_for_structure() {
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        let addition = get_hashes_of(&[9]);
+        pollard.modify(&addition, &[], &Proof::default()).unwrap();
+        let nodes = pollard.cached_nodes();
+        let state = PhysicalNodeState {
+            ready: true,
+            spent: false,
+            hash: addition[0].hash,
+        };
+        pollard.retain_physical_nodes(4, [(0, state)]);
+        assert_eq!(pollard.cached_nodes(), nodes);
+        let remembered = &pollard.position_index[&(PositionKind::Remembered, 0)];
+        let physical = &pollard.position_index[&(PositionKind::Physical, 0)];
+        assert!(Rc::ptr_eq(&remembered.node, &physical.node));
+
+        let bytes = pollard.estimated_compact_memory_usage();
+        let unknown = PhysicalNodeState {
+            ready: false,
+            spent: false,
+            hash: hash_from_u8(10),
+        };
+        pollard.retain_physical_nodes(4, [(16, unknown)]);
+        assert_eq!(pollard.cached_nodes(), nodes + 1);
+        assert!(pollard.estimated_compact_memory_usage() > bytes);
+        assert_eq!(pollard.physical_node(32, 5), Some(unknown));
+        pollard.clear_physical_nodes();
+        assert_eq!(pollard.cached_nodes(), nodes);
+        assert_eq!(pollard.leaf_position(&addition[0].hash), Some(0));
+        assert_eq!(pollard.position_hash(0), Some(addition[0].hash));
+        assert_eq!(pollard.remembered_leaf_hash(0), Some(addition[0].hash));
+        // Logical promotion coordinates must not shadow stable eviction lookup.
+        pollard.index_hash(PositionKind::Logical, 0, hash_from_u8(11), true, false);
+        assert_eq!(pollard.position_hash(0), Some(hash_from_u8(11)));
+        assert_eq!(pollard.remembered_leaf_hash(0), Some(addition[0].hash));
+    }
+
+    #[test]
+    fn physical_overwrites_preserve_owned_before_images_and_clones() {
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        let first = PhysicalNodeState {
+            ready: true,
+            spent: false,
+            hash: hash_from_u8(1),
+        };
+        pollard.retain_physical_nodes(3, [(8, first)]);
+        let before = pollard.physical_node(8, 3).unwrap();
+        let snapshot = pollard.clone();
+        let second = PhysicalNodeState {
+            ready: true,
+            spent: true,
+            hash: hash_from_u8(2),
+        };
+        pollard.retain_physical_nodes(4, [(16, second)]);
+        assert_eq!(before, first);
+        assert_eq!(snapshot.physical_node(16, 4), Some(first));
+        assert_eq!(pollard.physical_node(8, 3), Some(second));
+        // Updating flags must not mutate another role's shared hash or state.
+        let third = PhysicalNodeState {
+            spent: false,
+            ..second
+        };
+        pollard.retain_physical_nodes(4, [(16, third)]);
+        assert_eq!(snapshot.physical_node(8, 3), Some(first));
+        assert_eq!(pollard.physical_node(16, 4), Some(third));
+    }
+
+    #[test]
+    fn physical_metadata_does_not_change_pollard_serialization() {
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        pollard
+            .modify(&get_hashes_of(&[0, 1]), &[], &Proof::default())
+            .unwrap();
+        let mut before = Vec::new();
+        pollard.serialize(&mut before).unwrap();
+        pollard.retain_physical_nodes(
+            3,
+            [(
+                0,
+                PhysicalNodeState {
+                    ready: true,
+                    spent: true,
+                    hash: hash_from_u8(0),
+                },
+            )],
+        );
+        let mut after = Vec::new();
+        pollard.serialize(&mut after).unwrap();
+        assert_eq!(before, after);
+        let restored = Pollard::<BitcoinNodeHash>::deserialize(&mut &after[..]).unwrap();
+        assert_eq!(restored.roots(), pollard.roots());
+        assert_eq!(restored.leaves(), pollard.leaves());
+        assert_eq!(restored.physical_node(0, 3), None);
     }
 }
