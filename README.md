@@ -24,6 +24,13 @@ This library implements three accumulator primitives:
 
 where $n$ is the number of leaves, and $k$ is the number of cached leaves.
 
+When hydrating a partial Pollard, `remember_leaf` associates an authenticated
+canonical node with its stable bottom-row position from the caller's authoritative
+leaf index. Deletions can relocate whole subtrees: the canonical position need not
+be an ancestor of the stable position. Registration checks coordinate bounds, the
+hydrated hash, and conflicting stable mappings; the original position cannot be
+derived from the Merkle proof alone.
+
 ## Usage
 
 ```rs

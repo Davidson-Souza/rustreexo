@@ -819,11 +819,12 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     /// Remember an already hydrated leaf under its stable bottom-row position.
     ///
     /// `canonical_position` uses the current forest rows, as in
-    /// [`Self::ingest_positions`], and may be an ancestor of `stable_position`
-    /// after deletions promote the leaf. The canonical node and hash must have
-    /// been authenticated against the current roots before calling this method.
+    /// [`Self::ingest_positions`]. Deletions can promote and relocate entire
+    /// subtrees, so it need not be an ancestor of `stable_position`. The canonical
+    /// node and hash must have been authenticated against the current roots.
     /// The caller supplies the stable position from its authoritative leaf index;
-    /// a Merkle proof alone cannot recover a promoted leaf's original position.
+    /// neither a Merkle proof nor canonical ancestry establishes the original
+    /// position of a relocated leaf.
     ///
     /// Stable lookup survives [`Self::modify_stump`]. Proof paths needed after
     /// mutation must separately be retained with [`Self::retain_physical_nodes`].
@@ -838,12 +839,19 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             return Err(PollardError::InvalidProof);
         }
         let rows = tree_rows(self.leaves);
-        let mut ancestor = stable_position;
-        while ancestor != canonical_position {
-            if is_root_position(ancestor, self.leaves, rows) {
-                return Err(PollardError::InvalidProof);
-            }
-            ancestor = parent(ancestor, rows);
+        // Validate the canonical coordinate itself, not its relationship to the
+        // caller's stable identity. Reject absent rows/tail slots before walking
+        // the pointer tree, whose offset calculation assumes a populated tree.
+        if u128::from(canonical_position) >= (1u128 << (rows + 1)) - 1 {
+            return Err(PollardError::InvalidProof);
+        }
+        let row = detect_row(canonical_position, rows);
+        if self.leaves >> row == 0
+            || canonical_position
+                > max_position_at_row(row, rows, self.leaves)
+                    .map_err(|_| PollardError::InvalidProof)?
+        {
+            return Err(PollardError::InvalidProof);
         }
         let node = self
             .grab_position(canonical_position)
@@ -2690,6 +2698,77 @@ mod tests {
     }
 
     #[test]
+    fn remember_leaf_rejects_unpopulated_canonical_positions() {
+        let hashes: Vec<_> = get_hashes_of(&[0, 1, 2, 3, 4])
+            .into_iter()
+            .map(|addition| addition.hash)
+            .collect();
+        let mut forest = MemForest::<BitcoinNodeHash>::new_with_hash();
+        forest.modify(&hashes, &[]).unwrap();
+        let mut roots: Vec<_> = forest
+            .get_roots()
+            .iter()
+            .map(|root| root.get_data())
+            .collect();
+        roots.reverse();
+        let mut pollard = Pollard::from_roots(&roots, forest.leaves);
+        // Three rows have unused tail slots; the top row has no root.
+        for canonical in [5, 6, 7, 10, 11, 13, 14, 15, u64::MAX] {
+            assert!(matches!(
+                pollard.remember_leaf(0, canonical, hashes[0]),
+                Err(PollardError::InvalidProof)
+            ));
+        }
+        assert_eq!(pollard.leaf_position(&hashes[0]), None);
+        assert_eq!(pollard.remembered_leaf_hash(0), None);
+    }
+
+    #[test]
+    fn remember_leaf_accepts_authenticated_subtree_relocation() {
+        let hashes: Vec<_> = get_hashes_of(&[0, 1, 2, 3, 4, 5, 6, 7])
+            .into_iter()
+            .map(|addition| addition.hash)
+            .collect();
+        let mut forest = MemForest::<BitcoinNodeHash>::new_with_hash();
+        forest.modify(&hashes, &[]).unwrap();
+        forest.modify(&[], &hashes[..2]).unwrap();
+        let rows = tree_rows(forest.leaves);
+        let mut roots: Vec<_> = forest
+            .get_roots()
+            .iter()
+            .map(|root| root.get_data())
+            .collect();
+        roots.reverse();
+        let leaf = hashes[2];
+        let proof = forest.prove(&[leaf]).unwrap();
+        let canonical = translate(proof.targets[0], MAX_FOREST_ROWS, rows);
+        let mut ancestor = 2;
+        while !is_root_position(ancestor, forest.leaves, rows) {
+            assert_ne!(ancestor, canonical);
+            ancestor = parent(ancestor, rows);
+        }
+        assert_ne!(ancestor, canonical);
+        let mut positions = vec![(canonical, leaf)];
+        positions.extend(
+            get_proof_positions(&[canonical], forest.leaves, rows)
+                .into_iter()
+                .zip(proof.hashes.iter().copied()),
+        );
+        let mut pollard = Pollard::from_roots(&roots, forest.leaves);
+        pollard.ingest_positions(&[canonical], &positions).unwrap();
+        pollard.remember_leaf(2, canonical, leaf).unwrap();
+        assert_eq!(pollard.leaf_position(&leaf), Some(2));
+        assert_eq!(pollard.remembered_leaf_hash(2), Some(leaf));
+        assert_eq!(pollard.batch_proof(&[leaf]).unwrap(), proof);
+        assert!(pollard.remember_leaf(3, canonical, leaf).is_err());
+        assert!(pollard.remember_leaf(2, canonical, hashes[3]).is_err());
+        pollard.prune(&[2]).unwrap();
+        assert_eq!(pollard.leaf_position(&leaf), None);
+        assert_eq!(pollard.remembered_leaf_hash(2), None);
+        assert!(pollard.batch_proof(&[leaf]).is_err());
+    }
+
+    #[test]
     fn hydrated_promoted_leaf_rejects_bad_registration_and_prunes_both_aliases() {
         let additions = get_hashes_of(&[0, 1, 2, 3, 4, 5, 6, 7]);
         let hashes = additions
@@ -2723,7 +2802,6 @@ mod tests {
             assert!(partial.remember_leaf(1, canonical, leaf).is_err());
             partial.ingest_positions(&[canonical], &positions).unwrap();
             assert!(partial.remember_leaf(1, canonical, hashes[2]).is_err());
-            assert!(partial.remember_leaf(3, canonical, leaf).is_err());
             assert!(partial
                 .remember_leaf(witness.leaves, canonical, leaf)
                 .is_err());
